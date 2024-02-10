@@ -1,1 +1,1 @@
-pub static TAB_SPACES: usize = 10;
+pub static TAB_SPACES: usize = 4;
