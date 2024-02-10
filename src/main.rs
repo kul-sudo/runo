@@ -102,20 +102,14 @@ impl Editor {
                 //     Vec::new()
                 // }
 
-                let mut new_line = Vec::new();
-
-                for char in line {
+                line.iter().map(|char| {
                     if *char == '\t' {
-                        new_line.push(" ".repeat(TAB_SPACES))
+                        " ".repeat(TAB_SPACES)
                     } else {
-                        new_line.push(char.to_string())
+                        char.to_string()
                     }
-                }
-
-                self.debug_text = format!("{:?}", new_line);
-                new_line
+                })
             })
-            .iter()
             .enumerate()
             {
                 _ = self.stdout.execute(MoveTo(
