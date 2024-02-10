@@ -1,14 +1,18 @@
 #![feature(allocator_api)]
 
+mod constants;
+
+use constants::*;
+
 use crossterm::{
-    cursor::{self, MoveTo, SetCursorStyle},
-    event::{read, Event, KeyCode},
+    cursor::{MoveTo, SetCursorStyle},
+    event::{read, Event, KeyCode, KeyModifiers},
     style::{Color, Print, PrintStyledContent, Stylize},
     terminal::{
         disable_raw_mode, enable_raw_mode, size, Clear, ClearType, EnterAlternateScreen,
         LeaveAlternateScreen,
     },
-    ExecutableCommand, QueueableCommand,
+    ExecutableCommand,
 };
 use std::alloc::Global;
 use std::io::{stdout, Stdout, Write};
@@ -29,25 +33,29 @@ enum Actions {
     ModeToNormal,
     ModeToInsert,
     AddChar(char),
+    Tab,
     DeleteChar,
     Exit,
 }
 
 struct Buffer {
+    cx: usize,
     lines: Vec<Vec<char>>,
 }
 
 impl Buffer {
     fn insert(&mut self, x: usize, y: usize, char: char) {
-        if self.lines.get_mut(y).is_none() {
-            self.lines.resize(y + 1, Vec::new_in(Global))
-        }
+        if char != '\n' {
+            if self.lines.get_mut(y).is_none() {
+                self.lines.resize(y + 1, Vec::new_in(Global))
+            }
 
-        let line = self.lines.get_mut(y).unwrap();
-        if line.get_mut(x).is_none() {
-            line.resize(x + 1, char::default())
+            let line = self.lines.get_mut(y).unwrap();
+            if line.get_mut(x).is_none() {
+                line.resize(x + 1, char::default())
+            }
+            self.lines.get_mut(y).unwrap().insert(x, char);
         }
-        self.lines.get_mut(y).unwrap().insert(x, char);
     }
 
     fn remove(&mut self, x: usize, y: usize) {
@@ -57,48 +65,99 @@ impl Buffer {
         }
     }
 
-    // fn max_line_len(&self) -> usize {
-    //     self.lines
-    //         .iter()
-    //         .max_by_key(|line| line.len())
-    //         .unwrap()
-    //         .len()
-    // }
+    fn len(&self, line_n: usize) -> usize {
+        match self.lines.get(line_n) {
+            Some(line) if !line.is_empty() => {
+                line.len() + line.iter().filter(|x| **x == '\t').count() * (TAB_SPACES - 1)
+            }
+            _ => 0,
+        }
+    }
 }
 
 struct Editor {
+    /// Cursor X.
     cx: usize,
+
+    /// Cursor Y.
     cy: usize,
+
     mode: Mode,
     stdout: Stdout,
+    debug_text: String,
     size: (u16, u16),
     buffer: Buffer,
+    first_print_x: usize,
 }
 
 impl Editor {
     fn draw(&mut self) {
         self.status_line();
         for (y, line) in self.buffer.lines.iter().enumerate() {
-            for (x, char) in line.iter().enumerate() {
-                _ = self.stdout.queue(MoveTo(x as u16, y as u16));
-                _ = self.stdout.queue(Print(char));
+            for (x, char) in ({
+                // TODO: // Shift the lines to the left when the current line is longer than the limit
+                // if self.buffer.len(y) > self.first_print_x {
+                //     line[self.first_print_x..].to_vec()
+                // } else {
+                //     Vec::new()
+                // }
+
+                let mut new_line = Vec::new();
+
+                for char in line {
+                    if *char == '\t' {
+                        new_line.push(" ".repeat(TAB_SPACES))
+                    } else {
+                        new_line.push(char.to_string())
+                    }
+                }
+
+                self.debug_text = format!("{:?}", new_line);
+                new_line
+            })
+            .iter()
+            .enumerate()
+            {
+                _ = self.stdout.execute(MoveTo(
+                    (x + ((TAB_SPACES - 1) * line[..=x].iter().filter(|x| **x == '\t').count()))
+                        as u16,
+                    y as u16,
+                ));
+                _ = self.stdout.execute(Print(char));
             }
         }
 
-        _ = self.stdout.queue(match self.mode {
+        _ = self.stdout.execute(match self.mode {
             Mode::Normal => SetCursorStyle::SteadyBlock,
             Mode::Insert => SetCursorStyle::DefaultUserShape,
         });
-        _ = self.stdout.queue(MoveTo(self.cx as u16, self.cy as u16));
+
+        self.cx = match self.buffer.lines.get(self.cy) {
+            Some(line) if !line.is_empty() => {
+                self.buffer.cx
+                    + ((TAB_SPACES - 1)
+                        * line[..=self.buffer.cx]
+                            .iter()
+                            .filter(|x| **x == '\t')
+                            .count())
+            }
+            _ => 0,
+        };
+
+        _ = self.stdout.execute(MoveTo(
+            // TODO: (self.cx.saturating_sub(self.first_print_x)) as u16,
+            self.cx as u16,
+            self.cy as u16,
+        ));
         _ = self.stdout.flush();
     }
 
     pub fn status_line(&mut self) {
-        _ = self.stdout.queue(MoveTo(0, self.size.1));
+        _ = self.stdout.execute(MoveTo(0, self.size.1));
 
         _ = self
             .stdout
-            .queue(PrintStyledContent(
+            .execute(PrintStyledContent(
                 format!("{:?}", self.mode)
                     .to_uppercase()
                     .with(Color::Black)
@@ -106,15 +165,7 @@ impl Editor {
                     .on_cyan(),
             ))
             .unwrap()
-            .queue(PrintStyledContent(
-                format!(" {:?}", self.buffer.lines.len())
-                    .to_uppercase()
-                    .with(Color::Black)
-                    .bold()
-                    .on_cyan(),
-            ))
-            .unwrap()
-            .queue(PrintStyledContent(
+            .execute(PrintStyledContent(
                 format!(" {:?}", [self.cx, self.cy])
                     .to_uppercase()
                     .with(Color::Black)
@@ -122,65 +173,88 @@ impl Editor {
                     .on_cyan(),
             ))
             .unwrap()
-            .queue(PrintStyledContent(
-                format!(
-                    " {:?}%",
-                    (self.cy as f64 / self.buffer.lines.len() as f64) * 100_f64
-                )
-                .to_uppercase()
-                .with(Color::Black)
-                .bold()
-                .on_cyan(),
+            // .queue(PrintStyledContent(
+            //     format!(" {:?}", {
+            //         let line = self.buffer.lines.get(self.cy);
+            //
+            //         if line.is_some() {
+            //             let char = line.unwrap().get(self.cx.saturating_sub(1));
+            //
+            //             if char.is_some() {
+            //                 char.unwrap().to_string()
+            //             } else {
+            //                 "".to_string()
+            //             }
+            //         } else {
+            //             "".to_string()
+            //         }
+            //     })
+            //     .to_uppercase()
+            //     .with(Color::Black)
+            //     .bold()
+            //     .on_cyan(),
+            // ))
+            // .unwrap()
+            .execute(PrintStyledContent(
+                self.debug_text.clone().with(Color::Black).bold().on_cyan(),
             ));
     }
 
     fn work(&mut self) {
         loop {
-            self.draw();
-
+            // self.draw();
+            //
             if let Some(action) = self.handle_event(read().unwrap()) {
                 match action {
                     Actions::Exit => break,
                     Actions::MoveUp => {
                         self.cy = self.cy.saturating_sub(1);
-                        self.cx = self.buffer.lines.get(self.cy).unwrap().len();
-                        _ = self.stdout.execute(Clear(ClearType::All));
+                        self.buffer.cx = self.buffer.len(self.cy).saturating_sub(1);
                     }
                     Actions::MoveDown => {
                         let next_line = self.buffer.lines.get(self.cy + 1);
                         if next_line.is_some() {
-                            self.cx = next_line.unwrap().len();
+                            self.buffer.cx = self.buffer.len(self.cy + 1).saturating_sub(1);
                             self.cy += 1;
                         }
-                        _ = self.stdout.execute(Clear(ClearType::All));
                     }
                     Actions::MoveLeft => {
-                        self.cx = self.cx.saturating_sub(1);
-                        _ = self.stdout.execute(Clear(ClearType::All));
+                        let line = self.buffer.lines.get(self.cy).unwrap();
+                        let char = line.get(self.buffer.cx.saturating_sub(1));
+                        if char.is_some() {
+                            self.buffer.cx =
+                                self.buffer.cx.saturating_sub(if char.unwrap() == &'\t' {
+                                    TAB_SPACES
+                                } else {
+                                    1
+                                })
+                        }
                     }
                     Actions::MoveRight => {
-                        let line = self.buffer.lines.get(self.cy);
-                        if line.is_some() && line.unwrap().len() > self.cx + 1 {
-                            self.cx += 1
+                        let line = self.buffer.lines.get(self.cy).unwrap();
+                        let char = line.get(self.buffer.cx + 1);
+                        if char.is_some() {
+                            self.buffer.cx += if char.unwrap() == &'\t' {
+                                TAB_SPACES
+                            } else {
+                                1
+                            }
                         }
-                        _ = self.stdout.execute(Clear(ClearType::All));
                     }
                     Actions::NewLine => {
                         // if self.buffer.lines.get(self.cy).unwrap().len() == self.cx {
-                        self.buffer.insert(self.cx, self.cy, '\n');
+                        self.buffer.insert(self.buffer.cx, self.cy, '\n');
                         self.cy += 1;
-                        self.cx = 0;
+                        self.buffer.cx = 0;
                         // };
-                        _ = self.stdout.execute(Clear(ClearType::All));
                     }
                     Actions::Backspace => {
-                        if self.cx > 0 {
-                            self.buffer.remove(self.cx - 1, self.cy);
-                            self.cx -= 1;
+                        if self.buffer.cx > 0 {
+                            self.buffer.remove(self.buffer.cx - 1, self.cy);
+                            self.buffer.cx -= 1;
                         } else {
                             self.cy = self.cy.saturating_sub(1);
                         }
-                        _ = self.stdout.execute(Clear(ClearType::All));
                     }
                     Actions::ModeToNormal => {
                         self.mode = Mode::Normal;
@@ -189,15 +263,20 @@ impl Editor {
                         self.mode = Mode::Insert;
                     }
                     Actions::AddChar(char) => {
-                        self.buffer.insert(self.cx, self.cy, char);
-                        self.cx += 1;
-                        _ = self.stdout.execute(Clear(ClearType::All));
+                        self.buffer.insert(self.buffer.cx, self.cy, char);
+                        self.buffer.cx += 1;
+                    }
+                    Actions::Tab => {
+                        self.buffer.insert(self.buffer.cx, self.cy, '\t');
+                        self.buffer.cx += 1;
                     }
                     Actions::DeleteChar => {
-                        self.buffer.remove(self.cx, self.cy);
-                        _ = self.stdout.execute(Clear(ClearType::All));
+                        self.buffer.remove(self.buffer.cx, self.cy);
                     }
                 };
+
+                _ = self.stdout.execute(Clear(ClearType::All));
+                self.draw();
             };
         }
     }
@@ -215,17 +294,26 @@ impl Editor {
                             // Handling events for the normal mode
                             Mode::Normal => match event.code {
                                 KeyCode::Char('q') => Some(Actions::Exit),
-                                KeyCode::Char('i') => Some(Actions::ModeToInsert),
-                                KeyCode::Char('d') => Some(Actions::DeleteChar),
+                                KeyCode::Char('i') | KeyCode::Char('i')
+                                    if event.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    Some(Actions::ModeToInsert)
+                                }
+                                KeyCode::Char('d') | KeyCode::Delete => Some(Actions::DeleteChar),
                                 _ => None,
                             },
 
                             // Handling events for the insert mode
                             Mode::Insert => match event.code {
-                                KeyCode::Esc => Some(Actions::ModeToNormal),
+                                KeyCode::Char('i')
+                                    if event.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    Some(Actions::ModeToNormal)
+                                }
                                 KeyCode::Backspace => Some(Actions::Backspace),
                                 KeyCode::Enter => Some(Actions::NewLine),
                                 KeyCode::Char(char) => Some(Actions::AddChar(char)),
+                                KeyCode::Tab => Some(Actions::Tab),
                                 _ => None,
                             },
                         }
@@ -259,7 +347,9 @@ fn main() {
         mode: Mode::Normal,
         stdout: stdout(),
         size: size().unwrap(),
+        debug_text: String::new(),
         buffer: Buffer {
+            cx: 0,
             lines: {
                 let mut vector = Vec::new();
                 vector.resize(1, Vec::new_in(Global));
@@ -267,9 +357,12 @@ fn main() {
                 vector
             },
         },
+        first_print_x: 0,
     };
 
     editor.run();
+
+    editor.draw();
     editor.work();
     editor.drop();
 }
