@@ -39,7 +39,6 @@ enum Actions {
 }
 
 struct Buffer {
-    cx: usize,
     lines: Vec<Vec<char>>,
 }
 
@@ -62,15 +61,6 @@ impl Buffer {
         let line = self.lines.get(y);
         if line.is_some() && line.unwrap().get(x).is_some() {
             self.lines.get_mut(y).unwrap().remove(x);
-        }
-    }
-
-    fn len(&self, line_n: usize) -> usize {
-        match self.lines.get(line_n) {
-            Some(line) if !line.is_empty() => {
-                line.len() + line.iter().filter(|x| **x == '\t').count() * (TAB_SPACES - 1)
-            }
-            _ => 0,
         }
     }
 }
@@ -102,21 +92,12 @@ impl Editor {
                 //     Vec::new()
                 // }
 
-                line.iter().map(|char| {
-                    if *char == '\t' {
-                        " ".repeat(TAB_SPACES)
-                    } else {
-                        char.to_string()
-                    }
-                })
+                line
             })
+            .iter()
             .enumerate()
             {
-                _ = self.stdout.execute(MoveTo(
-                    (x + ((TAB_SPACES - 1) * line[..=x].iter().filter(|x| **x == '\t').count()))
-                        as u16,
-                    y as u16,
-                ));
+                _ = self.stdout.execute(MoveTo(x as u16, y as u16));
                 _ = self.stdout.execute(Print(char));
             }
         }
@@ -126,17 +107,18 @@ impl Editor {
             Mode::Insert => SetCursorStyle::DefaultUserShape,
         });
 
-        self.cx = match self.buffer.lines.get(self.cy) {
-            Some(line) if !line.is_empty() => {
-                self.buffer.cx
-                    + ((TAB_SPACES - 1)
-                        * line[..=self.buffer.cx]
-                            .iter()
-                            .filter(|x| **x == '\t')
-                            .count())
-            }
-            _ => 0,
-        };
+        // self.cx = match self.buffer.lines.get(self.cy) {
+        //     Some(line) if !line.is_empty() => {
+        //         // self.debug_text = format!("{:?} {:?}", self.buffer.cx, line);
+        //         self.buffer.cx
+        //             + ((TAB_SPACES - 1)
+        //                 * line[..=self.buffer.cx]
+        //                     .iter()
+        //                     .filter(|x| **x == '\t')
+        //                     .count())
+        //     }
+        //     _ => 0,
+        // };
 
         _ = self.stdout.execute(MoveTo(
             // TODO: (self.cx.saturating_sub(self.first_print_x)) as u16,
@@ -203,49 +185,42 @@ impl Editor {
                     Actions::Exit => break,
                     Actions::MoveUp => {
                         self.cy = self.cy.saturating_sub(1);
-                        self.buffer.cx = self.buffer.len(self.cy).saturating_sub(1);
+                        let previous_line = self.buffer.lines.get(self.cy.saturating_sub(1));
+                        if previous_line.is_some() {
+                            self.cx = previous_line.unwrap().len();
+                            self.cy = self.cy.saturating_sub(1)
+                        }
                     }
                     Actions::MoveDown => {
                         let next_line = self.buffer.lines.get(self.cy + 1);
                         if next_line.is_some() {
-                            self.buffer.cx = self.buffer.len(self.cy + 1).saturating_sub(1);
+                            self.cx = next_line.unwrap().len();
                             self.cy += 1;
                         }
                     }
                     Actions::MoveLeft => {
                         let line = self.buffer.lines.get(self.cy).unwrap();
-                        let char = line.get(self.buffer.cx.saturating_sub(1));
+                        let char = line.get(self.cx.saturating_sub(1));
                         if char.is_some() {
-                            self.buffer.cx =
-                                self.buffer.cx.saturating_sub(if char.unwrap() == &'\t' {
-                                    TAB_SPACES
-                                } else {
-                                    1
-                                })
+                            self.cx = self.cx.saturating_sub(1)
                         }
                     }
                     Actions::MoveRight => {
                         let line = self.buffer.lines.get(self.cy).unwrap();
-                        let char = line.get(self.buffer.cx + 1);
+                        let char = line.get(self.cx + 1);
                         if char.is_some() {
-                            self.buffer.cx += if char.unwrap() == &'\t' {
-                                TAB_SPACES
-                            } else {
-                                1
-                            }
+                            self.cx += 1
                         }
                     }
                     Actions::NewLine => {
-                        // if self.buffer.lines.get(self.cy).unwrap().len() == self.cx {
-                        self.buffer.insert(self.buffer.cx, self.cy, '\n');
+                        self.buffer.insert(self.cx, self.cy, '\n');
                         self.cy += 1;
-                        self.buffer.cx = 0;
-                        // };
+                        self.cx = 0;
                     }
                     Actions::Backspace => {
-                        if self.buffer.cx > 0 {
-                            self.buffer.remove(self.buffer.cx - 1, self.cy);
-                            self.buffer.cx -= 1;
+                        if self.cx > 0 {
+                            self.buffer.remove(self.cx - 1, self.cy);
+                            self.cx -= 1;
                         } else {
                             self.cy = self.cy.saturating_sub(1);
                         }
@@ -257,15 +232,17 @@ impl Editor {
                         self.mode = Mode::Insert;
                     }
                     Actions::AddChar(char) => {
-                        self.buffer.insert(self.buffer.cx, self.cy, char);
-                        self.buffer.cx += 1;
+                        self.buffer.insert(self.cx, self.cy, char);
+                        self.cx += 1;
                     }
                     Actions::Tab => {
-                        self.buffer.insert(self.buffer.cx, self.cy, '\t');
-                        self.buffer.cx += 1;
+                        for _ in 0..TAB_SPACES {
+                            self.buffer.insert(self.cx, self.cy, ' ');
+                            self.cx += 4;
+                        }
                     }
                     Actions::DeleteChar => {
-                        self.buffer.remove(self.buffer.cx, self.cy);
+                        self.buffer.remove(self.cx, self.cy);
                     }
                 };
 
@@ -343,7 +320,6 @@ fn main() {
         size: size().unwrap(),
         debug_text: String::new(),
         buffer: Buffer {
-            cx: 0,
             lines: {
                 let mut vector = Vec::new();
                 vector.resize(1, Vec::new_in(Global));
